@@ -8,16 +8,53 @@ import type { AnalysisResult, Difference, DiffStatus } from "@/lib/types";
 import ImageViewer from "@/components/ImageViewer";
 import DiffList from "@/components/DiffList";
 
-const STATUS_STEPS = ["pending", "processing", "done"];
-const STEP_LABELS = ["이미지 전처리", "픽셀 비교", "AI 분석"];
+// 진행 단계 정의
+const PIPELINE_STEPS: Record<string, { steps: string[]; labels: string[] }> = {
+  v1_cv: {
+    steps: ["normalize", "cv_measure", "ai_label", "ai_visual", "finalize"],
+    labels: ["이미지 전처리", "CV 간격 측정", "AI 라벨링", "AI 시각 분석", "결과 생성"],
+  },
+};
+const DEFAULT_PIPELINE = "v1_cv";
 
 export default function ResultPage() {
   const { id } = useParams<{ id: string }>();
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [pollingStatus, setPollingStatus] = useState<string>("pending");
+  const [progressStep, setProgressStep] = useState<string | null>(null);
+  const [pipelineVersion, setPipelineVersion] = useState<string>(DEFAULT_PIPELINE);
   const [error, setError] = useState<string | null>(null);
   const [activeDiffId, setActiveDiffId] = useState<string | null>(null);
+  const [hoveredDiffId, setHoveredDiffId] = useState<string | null>(null);
   const [shareMsg, setShareMsg] = useState<string | null>(null);
+
+  // 키보드 내비게이션 (↑↓ 화살표)
+  useEffect(() => {
+    if (!result) return;
+    const diffs = result.differences;
+    if (diffs.length === 0) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      // input/textarea 안에서는 무시
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+      e.preventDefault();
+      const curIdx = diffs.findIndex((d) => d.id === activeDiffId);
+
+      let nextIdx: number;
+      if (e.key === "ArrowDown") {
+        nextIdx = curIdx < diffs.length - 1 ? curIdx + 1 : 0;
+      } else {
+        nextIdx = curIdx > 0 ? curIdx - 1 : diffs.length - 1;
+      }
+      setActiveDiffId(diffs[nextIdx].id);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [result, activeDiffId]);
 
   // 분석 완료까지 폴링
   useEffect(() => {
@@ -28,9 +65,14 @@ export default function ResultPage() {
       try {
         const s = await getStatus(id);
         setPollingStatus(s.status);
+        if (s.progress_step) setProgressStep(s.progress_step);
+        if (s.pipeline_version) setPipelineVersion(s.pipeline_version);
         if (s.status === "done") {
           const r = await getResult(id);
           setResult(r);
+          // 첫 번째 미해결 항목 자동 선택 (진입 시 바로 맥락 제공)
+          const firstVisible = r.differences.find((d: Difference) => d.status !== "ignored");
+          if (firstVisible) setActiveDiffId(firstVisible.id);
         } else if (s.status === "failed") {
           setError(s.error_message ?? "분석에 실패했습니다.");
         } else {
@@ -74,7 +116,10 @@ export default function ResultPage() {
 
   // ── 분석 중 로딩 화면 ──────────────────────────────────────
   if (!result && !error) {
-    const stepIdx = STATUS_STEPS.indexOf(pollingStatus);
+    const pipeline = PIPELINE_STEPS[pipelineVersion] ?? PIPELINE_STEPS[DEFAULT_PIPELINE];
+    const stepIdx = progressStep ? pipeline.steps.indexOf(progressStep) : -1;
+
+    const pipelineLabel = "CV 측정 + AI 분석";
 
     return (
       <div className="flex items-center justify-center min-h-[calc(100vh-57px)] bg-surface-50">
@@ -88,25 +133,25 @@ export default function ResultPage() {
 
           {/* 텍스트 */}
           <h2 className="text-center font-bold text-[#111] text-lg mb-1">
-            AI가 분석 중입니다
+            디자인 QA 분석 중
           </h2>
           <p className="text-center text-[#999] text-sm mb-8">
-            최대 30초 소요됩니다
+            {pipelineLabel} · 최대 30초
           </p>
 
           {/* 진행 단계 */}
           <div className="space-y-3">
-            {STEP_LABELS.map((label, i) => {
+            {pipeline.labels.map((label, i) => {
               const done    = i < stepIdx;
               const active  = i === stepIdx;
-              const pending = i > stepIdx;
+              const pending = i > stepIdx || stepIdx < 0;
               return (
                 <div key={label} className="flex items-center gap-3">
                   <div className={`
                     w-7 h-7 rounded-full flex items-center justify-center shrink-0 transition-colors
                     ${done    ? "bg-line-500"           : ""}
                     ${active  ? "bg-line-50 border-2 border-line-500" : ""}
-                    ${pending ? "bg-surface-50 border-2 border-surface-200" : ""}
+                    ${pending && !active ? "bg-surface-50 border-2 border-surface-200" : ""}
                   `}>
                     {done ? (
                       <CheckCircle size={14} className="text-white" />
@@ -241,6 +286,7 @@ export default function ResultPage() {
             devUrl={imageUrl(result.dev_image)}
             differences={differences}
             activeDiffId={activeDiffId}
+            hoveredDiffId={hoveredDiffId}
             onSelectDiff={setActiveDiffId}
             devImageSize={result.dev_image_size}
             designImageSize={result.design_image_size}
@@ -255,6 +301,7 @@ export default function ResultPage() {
                 <h2 className="text-sm font-bold text-[#111]">수정 사항</h2>
                 <p className="text-xs text-[#999] mt-0.5">
                   {differences.filter(d => d.status === "issue").length}개 미해결 · {differences.length}개 전체
+                  <span className="ml-2 text-[#b7b7b7]">↑↓ 이동</span>
                 </p>
               </div>
               <div className="flex items-center gap-2 text-xs text-[#999]">
@@ -274,6 +321,7 @@ export default function ResultPage() {
             differences={differences}
             activeDiffId={activeDiffId}
             onSelect={setActiveDiffId}
+            onHover={setHoveredDiffId}
             onStatusChange={handleStatusChange}
           />
         </div>

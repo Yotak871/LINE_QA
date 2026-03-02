@@ -17,9 +17,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="DesignSync API", version="1.0.0", lifespan=lifespan)
 
+# CORS: FRONTEND_URL이 설정되면 해당 origin만 허용, 아니면 전체 허용 (개발용)
+_cors_origins = (
+    [settings.frontend_url]
+    if settings.frontend_url and settings.frontend_url != "http://localhost:3000"
+    else ["*"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

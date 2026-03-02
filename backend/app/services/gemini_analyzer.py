@@ -1,7 +1,18 @@
+"""
+Gemini Vision AI — 역할: 섹션 라벨링 + 비-간격 차이(색상, 타이포, 누락) 감지.
+
+간격/마진/높이 측정은 CV(element_analyzer.py)가 정확하게 처리.
+Gemini는 AI가 잘하는 영역에만 집중:
+  1) 밴드 라벨링 — 각 UI 섹션이 무엇인지 명명
+  2) 시각적 차이 — 색상, 폰트 스타일, 아이콘 누락 등
+"""
+from __future__ import annotations
+
 import base64
 import json
 import re
-import numpy as np
+from typing import Optional, List, Dict
+
 from PIL import Image
 import io
 import google.generativeai as genai
@@ -9,309 +20,354 @@ from app.core.config import settings
 
 genai.configure(api_key=settings.gemini_api_key)
 
-# 모델 폴백 체인 — 할당량 초과 시 다음 모델로 자동 전환
 GEMINI_MODELS = [
-    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-pro-latest",
+    "gemini-2.0-flash-lite",
 ]
 
 
 # ──────────────────────────────────────────────────────────────
-# Gemini Vision 프롬프트 — 디자인 QA 전문가
+# 1단계: 밴드 라벨링 프롬프트
 # ──────────────────────────────────────────────────────────────
-ANALYSIS_PROMPT = """You are an expert UI/UX Design QA auditor for a mobile app team.
+LABELING_PROMPT = """You see a mobile screen image. I've detected {n_bands} horizontal UI sections (content bands).
 
-You will receive TWO images of the same mobile screen:
-- **Image 1**: The DESIGN original (디자인 원본 - created by UI designer)
-- **Image 2**: The DEV build (개발 Beta 버전 - actual implementation)
+The sections from top to bottom are at these Y positions:
+{band_info}
 
-Your job: Meticulously compare these two screens and find ALL visual differences.
+For each section, tell me what UI element it is (e.g., 상태바, 헤더, 일러스트/이미지, 타이틀, 본문 텍스트, 서브텍스트, CTA 버튼, 하단 내비게이션, 입력 필드, 카드, 리스트 아이템, 구분선, 아이콘 영역, etc.)
 
-**Focus areas (check every one):**
-1. **spacing** — margins, padding, gaps between elements (px differences)
-2. **typography** — font size, font weight, line-height, letter-spacing, text content differences
-3. **color** — background colors, text colors, border colors, button colors
-4. **layout** — element sizes (width/height), positions, alignment, border-radius
-5. **missing** — elements present in design but absent in dev, or vice versa
+Return ONLY a JSON array of Korean strings, one per section. No markdown, no explanation.
+Example: ["상태바", "헤더", "일러스트", "타이틀", "본문 텍스트", "CTA 버튼"]"""
 
-**Bounding box coordinates:**
-The DEV build image (Image 2) has dimensions {dev_width}×{dev_height} pixels.
-For each difference, provide the bounding box in PIXEL coordinates relative to the DEV image:
-- bbox_x: X position of the left edge (0 = left side of image)
-- bbox_y: Y position of the top edge (0 = top of image)
-- bbox_w: width of the bounding box
-- bbox_h: height of the bounding box
 
-**Return format: JSON array only, NO markdown, NO explanation.**
-Each item in the array:
-{{
-  "category": "spacing" | "typography" | "color" | "layout" | "missing",
-  "severity": "critical" | "major" | "minor",
-  "description": "한국어로 구체적인 설명 (어떤 요소가 정확히 어떻게 다른지)",
-  "design_value": "디자인 원본의 정확한 값",
-  "dev_value": "개발 버전의 정확한 값",
-  "bbox_x": integer,
-  "bbox_y": integer,
-  "bbox_w": integer,
-  "bbox_h": integer
-}}
+# ──────────────────────────────────────────────────────────────
+# 2단계: 비-간격 차이 감지 프롬프트 (색상, 타이포, 누락 요소)
+# ──────────────────────────────────────────────────────────────
+VISUAL_DIFF_PROMPT = """You are a Design QA specialist. The DESIGN is the source of truth (spec). The DEV build must match the design.
 
-**Severity guide:**
-- **critical**: 요소 누락, 레이아웃 완전히 깨짐, 잘못된 텍스트/이미지
-- **major**: 눈에 띄는 차이 (간격 >5px, 색상 차이 뚜렷, 폰트 크기 ±2px 이상)
-- **minor**: 미세한 차이 (간격 ≤4px, 미세한 색상 차이, 라운드 코너 차이)
+Compare these TWO mobile screen images:
+- Image 1: DESIGN mockup (디자인 시안) — 기준이 되는 정답
+- Image 2: DEV build (개발 결과물) — 검증 대상
 
-**Rules:**
-- Find 3~15 meaningful differences (모바일 화면이므로 꼼꼼히 비교)
-- Be SPECIFIC: "CTA 버튼과 하단 면책조항 텍스트 사이 간격이 24px이어야 하는데 16px입니다" (NOT "간격이 다릅니다")
-- Include CONCRETE values: pixel sizes, hex color codes, font specs
-- Bounding box must tightly surround the SPECIFIC element that is different
-- If text content differs between languages (localization), that's NOT a difference — focus on VISUAL/LAYOUT differences only
+DEV image: {dev_width}×{dev_height}px.
+
+**IMPORTANT: Do NOT report spacing/margin/padding differences.** (Those are handled separately by precise CV measurement.)
+
+**Only find where DEV deviates from DESIGN in these categories:**
+1. **color** — Background colors, text colors, button colors, icon tints that differ from design spec (provide HEX values)
+2. **typography** — Font size, weight, alignment, line-height that differ from design spec
+3. **missing** — Elements in design but missing in dev, or unexpected elements in dev not in design
+4. **layout** — Border-radius, element width, alignment issues compared to design spec
+
+Frame all descriptions from the DESIGN's perspective:
+- "design_value" = 디자인 기준값 (the correct/intended value)
+- "dev_value" = 개발 실제값 (what was actually implemented)
+- Description should say what the design specifies and how dev deviates
+
+Return ONLY a JSON array. No markdown fences.
+Each item:
+{{"category":"color"|"typography"|"missing"|"layout","severity":"critical"|"major"|"minor","description":"한국어 설명 — 디자인 기준 X, 개발에서 Y로 다름","design_value":"기준값","dev_value":"실제값","bbox_x":int,"bbox_y":int,"bbox_w":int,"bbox_h":int}}
+
+Find 0~10 differences. If no differences in these categories, return [].
 """
 
 
-def _img_to_bytes(img_path: str, max_dim: int = 1024) -> bytes:
-    """이미지를 로드하고 Gemini용으로 적절한 크기로 리사이즈."""
+def _img_to_bytes(img_path: str, max_dim: int = 2048) -> bytes:
+    """이미지를 로드. 작은 이미지는 원본 그대로 전송."""
     img = Image.open(img_path).convert("RGB")
-    # 너무 큰 이미지는 리사이즈 (토큰 절약 + 속도 향상)
+    if max(img.width, img.height) <= 1000:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
     if max(img.width, img.height) > max_dim:
         ratio = max_dim / max(img.width, img.height)
-        new_w = int(img.width * ratio)
-        new_h = int(img.height * ratio)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def _get_image_dimensions(img_path: str) -> tuple:
-    """이미지의 원본 크기를 반환."""
-    img = Image.open(img_path)
-    return img.width, img.height
-
-
-async def analyze_with_gemini(
-    design_path: str,
-    dev_path: str,
-    regions: list,
-    dev_width: int,
-    dev_height: int,
-) -> list:
-    """Gemini Vision API로 두 이미지를 비교 분석한다. 모델 폴백 체인 사용."""
-    if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
-        return _mock_analysis(regions, dev_width, dev_height)
-
-    # 두 이미지를 준비
-    design_bytes = _img_to_bytes(design_path, max_dim=1280)
-    dev_bytes = _img_to_bytes(dev_path, max_dim=1280)
-
-    design_part = {"mime_type": "image/png", "data": base64.b64encode(design_bytes).decode()}
-    dev_part = {"mime_type": "image/png", "data": base64.b64encode(dev_bytes).decode()}
-
-    # 프롬프트에 이미지 크기 정보 삽입
-    prompt = ANALYSIS_PROMPT.format(dev_width=dev_width, dev_height=dev_height)
-
-    # 픽셀 diff 영역 힌트 추가 (Gemini에게 참고 정보)
-    if regions:
-        hint_regions = [{"x": r["x"], "y": r["y"], "w": r["w"], "h": r["h"]} for r in regions[:8]]
-        prompt += f"\n\n**Pixel diff detected these regions (reference only, find all differences yourself):**\n{json.dumps(hint_regions)}"
-
-    # 모델 폴백 체인: 순서대로 시도
+def _call_gemini(prompt: str, image_parts: list) -> Optional[str]:
+    """Gemini 모델 체인 호출."""
     last_error = None
     for model_name in GEMINI_MODELS:
         try:
             print(f"[Gemini] 모델 시도: {model_name}")
             model = genai.GenerativeModel(model_name)
-
+            content = [prompt] + image_parts
             response = model.generate_content(
-                [prompt, design_part, dev_part],
-                generation_config={"temperature": 0.2, "max_output_tokens": 4096},
+                content,
+                generation_config={"temperature": 0.1, "max_output_tokens": 4096},
             )
             raw = response.text.strip()
-            print(f"[Gemini] {model_name} 응답 길이: {len(raw)}자")
-
-            # JSON 파싱 (markdown 코드블록 제거)
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            differences = json.loads(raw)
-
-            if not isinstance(differences, list):
-                print(f"[Gemini] {model_name} 응답이 배열이 아닙니다. 다음 모델 시도.")
-                continue
-
-            validated = _validate_differences(differences, dev_width, dev_height)
-            print(f"[Gemini] {model_name} 분석 완료: {len(validated)}개 차이점 발견")
-            return validated
-
+            print(f"[Gemini] {model_name} 응답: {len(raw)}자 — {raw[:150]}")
+            return raw
         except Exception as e:
             last_error = e
-            err_str = str(e)
-            print(f"[Gemini] {model_name} 실패: {err_str}")
-
-            # 429 (할당량 초과)인 경우 다음 모델로 시도
-            if "429" in err_str or "quota" in err_str.lower():
-                print(f"[Gemini] 할당량 초과. 다음 모델로 전환합니다.")
-                continue
-            # 그 외 에러도 다음 모델 시도
+            print(f"[Gemini] {model_name} 실패: {e}")
             continue
+    print(f"[Gemini] 모든 모델 실패: {last_error}")
+    return None
 
-    print(f"[Gemini] 모든 모델 실패. pixel diff 결과로 대체합니다. 마지막 에러: {last_error}")
-    return _fallback_from_regions(regions, dev_width, dev_height)
+
+def _parse_json(raw: str) -> Optional[list]:
+    """JSON 배열을 강건하게 파싱."""
+    if not raw:
+        return None
+
+    cleaned = raw.strip()
+    # 마크다운 코드 펜스 제거
+    cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned)
+    cleaned = re.sub(r'\n?\s*```\s*$', '', cleaned)
+    cleaned = cleaned.strip()
+
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # [ ... ] 추출
+    start = cleaned.find('[')
+    end = cleaned.rfind(']')
+    if start != -1 and end > start:
+        try:
+            return json.loads(cleaned[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    print(f"[Gemini] JSON 파싱 실패: {raw[:200]}")
+    return None
 
 
-def _validate_differences(diffs: list, dev_w: int, dev_h: int) -> list:
-    """Gemini 응답 유효성 검증 및 정규화."""
-    VALID_CATEGORIES = {"typography", "color", "spacing", "layout", "missing"}
+async def label_bands(
+    dev_path: str,
+    bands: List[Dict],
+) -> Optional[List[str]]:
+    """
+    Gemini를 사용하여 감지된 밴드에 의미론적 라벨 부여.
+    Returns: ["상태바", "헤더", "일러스트", ...] 또는 None
+    """
+    if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
+        return None
+    if not bands:
+        return None
+
+    dev_bytes = _img_to_bytes(dev_path)
+    dev_part = {"mime_type": "image/png", "data": base64.b64encode(dev_bytes).decode()}
+
+    band_info = "\n".join(
+        f"  Section {i+1}: y={b['y_start']}~{b['y_end']} (height={b['height']}px, "
+        f"left_margin={b['left_margin']}px, right_margin={b['right_margin']}px)"
+        for i, b in enumerate(bands)
+    )
+
+    prompt = LABELING_PROMPT.format(n_bands=len(bands), band_info=band_info)
+
+    print("[Gemini] 밴드 라벨링 시작")
+    raw = _call_gemini(prompt, [dev_part])
+    if not raw:
+        return None
+
+    parsed = _parse_json(raw)
+    if parsed and isinstance(parsed, list) and all(isinstance(s, str) for s in parsed):
+        print(f"[Gemini] 라벨: {parsed}")
+        return parsed
+
+    return None
+
+
+async def find_visual_diffs(
+    design_path: str,
+    dev_path: str,
+    dev_width: int,
+    dev_height: int,
+) -> List[Dict]:
+    """
+    색상, 타이포, 누락 요소 등 비-간격 차이를 감지.
+    (간격은 CV가 처리하므로 여기서는 제외)
+    """
+    if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
+        return []
+
+    design_bytes = _img_to_bytes(design_path)
+    dev_bytes = _img_to_bytes(dev_path)
+
+    design_part = {"mime_type": "image/png", "data": base64.b64encode(design_bytes).decode()}
+    dev_part = {"mime_type": "image/png", "data": base64.b64encode(dev_bytes).decode()}
+
+    prompt = VISUAL_DIFF_PROMPT.format(dev_width=dev_width, dev_height=dev_height)
+
+    print("[Gemini] 시각적 차이 분석 시작 (색상/타이포/누락)")
+    raw = _call_gemini(prompt, [design_part, dev_part])
+    if not raw:
+        return []
+
+    parsed = _parse_json(raw)
+    if not parsed:
+        return []
+
+    # 유효성 검증
+    VALID_CATEGORIES = {"typography", "color", "layout", "missing"}
     VALID_SEVERITIES = {"critical", "major", "minor"}
     valid = []
 
-    for d in diffs:
+    for d in parsed:
         if not isinstance(d, dict):
             continue
-        if not all(k in d for k in ["category", "severity", "description"]):
+        if "description" not in d:
             continue
 
-        d["category"] = str(d.get("category", "layout")).lower()
-        d["severity"] = str(d.get("severity", "minor")).lower()
+        cat = str(d.get("category", "layout")).lower().strip()
+        if cat not in VALID_CATEGORIES:
+            cat = "layout"
+        # spacing 카테고리가 들어오면 건너뛰기 (CV가 처리)
+        if cat == "spacing":
+            continue
 
-        if d["category"] not in VALID_CATEGORIES:
-            d["category"] = "layout"
-        if d["severity"] not in VALID_SEVERITIES:
-            d["severity"] = "minor"
+        sev = str(d.get("severity", "minor")).lower().strip()
+        if sev not in VALID_SEVERITIES:
+            sev = "minor"
 
-        # bbox 좌표 검증 및 클램핑
-        bbox_x = max(0, min(dev_w - 10, int(d.get("bbox_x", 0))))
-        bbox_y = max(0, min(dev_h - 10, int(d.get("bbox_y", 0))))
-        bbox_w = max(20, min(dev_w - bbox_x, int(d.get("bbox_w", 50))))
-        bbox_h = max(20, min(dev_h - bbox_y, int(d.get("bbox_h", 50))))
+        def safe_int(val, default=0):
+            try:
+                return int(float(val))
+            except (ValueError, TypeError):
+                return default
 
-        d["bbox_x"] = bbox_x
-        d["bbox_y"] = bbox_y
-        d["bbox_w"] = bbox_w
-        d["bbox_h"] = bbox_h
-        d["design_value"] = str(d.get("design_value", ""))
-        d["dev_value"] = str(d.get("dev_value", ""))
-        d["description"] = str(d.get("description", ""))
+        valid.append({
+            "category": cat,
+            "severity": sev,
+            "description": str(d.get("description", "")),
+            "design_value": str(d.get("design_value", "")),
+            "dev_value": str(d.get("dev_value", "")),
+            "bbox_x": max(0, min(dev_width - 10, safe_int(d.get("bbox_x")))),
+            "bbox_y": max(0, min(dev_height - 10, safe_int(d.get("bbox_y")))),
+            "bbox_w": max(10, min(dev_width, safe_int(d.get("bbox_w"), 50))),
+            "bbox_h": max(10, min(dev_height, safe_int(d.get("bbox_h"), 30))),
+        })
 
-        valid.append(d)
-
+    print(f"[Gemini] 시각적 차이: {len(valid)}개")
     return valid
 
 
-def _fallback_from_regions(regions: list, dev_w: int, dev_h: int) -> list:
-    """Gemini 실패 시 픽셀 차이 영역을 기반으로 기본 항목 생성."""
-    if not regions:
-        return [{
-            "category": "layout",
-            "severity": "major",
-            "description": "전체 화면에서 픽셀 차이가 감지되었습니다. 세부 항목은 수동 확인이 필요합니다.",
-            "design_value": "",
-            "dev_value": "",
-            "bbox_x": int(dev_w * 0.05),
-            "bbox_y": int(dev_h * 0.05),
-            "bbox_w": int(dev_w * 0.9),
-            "bbox_h": int(dev_h * 0.9),
-        }]
+# ──────────────────────────────────────────────────────────────
+# 3단계: 미커버 영역 타겟 분석 (pixel diff가 찾았지만 CV가 못 잡은 영역)
+# ──────────────────────────────────────────────────────────────
+TARGETED_DIFF_PROMPT = """You are a Design QA specialist examining a SPECIFIC region where pixel differences were detected.
 
-    result = []
-    total_area = dev_w * dev_h
+Compare these TWO cropped regions:
+- Image 1: DESIGN mockup (디자인 시안) — 기준
+- Image 2: DEV build (개발 결과물) — 검증 대상
 
-    for i, r in enumerate(regions[:12]):
-        r_area = r["w"] * r["h"]
-        area_pct = (r_area / total_area) * 100 if total_area > 0 else 0
+The region is at position ({rx}, {ry}) with size {rw}×{rh}px in the full {dev_width}×{dev_height}px screen.
 
-        # 위치 기반 카테고리 추정
-        center_y_pct = (r["y"] + r["h"] / 2) / dev_h
-        aspect_ratio = r["w"] / max(r["h"], 1)
+Analyze what is different in this specific region. Possible differences:
+1. **spacing** — Element positions shifted, gaps differ (provide px values)
+2. **layout** — Element sizes differ, alignment issues
+3. **color** — Colors differ (provide HEX)
+4. **typography** — Font size/weight/style differs
+5. **missing** — Elements present in one but not the other
 
-        if aspect_ratio > 3 and r["h"] < dev_h * 0.05:
-            category = "spacing"
-            location = "수평 간격/여백"
-        elif aspect_ratio < 0.3 and r["w"] < dev_w * 0.05:
-            category = "spacing"
-            location = "수직 간격/여백"
-        elif r["w"] > dev_w * 0.6 and r["h"] < dev_h * 0.08:
-            category = "typography"
-            location = "텍스트 영역"
-        elif r["w"] < dev_w * 0.15 and r["h"] < dev_h * 0.04:
-            category = "color"
-            location = "아이콘/색상"
-        else:
-            category = "layout"
-            location = "UI 요소"
+Return ONLY a JSON array. If genuinely identical, return [].
+Each item:
+{{"category":"spacing"|"layout"|"color"|"typography"|"missing","severity":"critical"|"major"|"minor","description":"한국어 설명","design_value":"기준값","dev_value":"실제값"}}
 
-        # 위치 설명
-        if center_y_pct < 0.15:
-            pos = "상단 (헤더/내비게이션)"
-        elif center_y_pct < 0.4:
-            pos = "상단 콘텐츠 영역"
-        elif center_y_pct < 0.7:
-            pos = "중앙 콘텐츠 영역"
-        elif center_y_pct < 0.85:
-            pos = "하단 콘텐츠 영역"
-        else:
-            pos = "하단 (푸터/CTA)"
-
-        if area_pct > 5:
-            severity = "critical"
-            desc = f"{pos}의 {location}에서 큰 차이 감지 — 화면의 {area_pct:.1f}% 영역. 수동 확인 필요"
-        elif area_pct > 1:
-            severity = "major"
-            desc = f"{pos}의 {location}에서 눈에 띄는 차이 감지 — 요소의 크기·위치·스타일이 다를 수 있습니다"
-        else:
-            severity = "minor"
-            desc = f"{pos}의 {location}에서 미세한 차이 감지 — 간격·색상·스타일의 미세한 차이"
-
-        result.append({
-            "category": category,
-            "severity": severity,
-            "description": desc,
-            "design_value": f"영역: {r['w']}×{r['h']}px",
-            "dev_value": f"위치: ({r['x']},{r['y']})",
-            "bbox_x": r["x"],
-            "bbox_y": r["y"],
-            "bbox_w": r["w"],
-            "bbox_h": r["h"],
-        })
-    return result
+Find the most significant difference in this region. Return at most 1-2 items."""
 
 
-def _mock_analysis(regions: list, dev_w: int, dev_h: int) -> list:
-    """API 키 없을 때 목업 데이터 반환."""
-    return [
-        {
-            "category": "spacing",
-            "severity": "major",
-            "description": "[Mock] 타이틀과 서브텍스트 사이 간격이 24px이어야 하는데 16px입니다.",
-            "design_value": "24px",
-            "dev_value": "16px",
-            "bbox_x": int(dev_w * 0.1),
-            "bbox_y": int(dev_h * 0.35),
-            "bbox_w": int(dev_w * 0.8),
-            "bbox_h": int(dev_h * 0.05),
-        },
-        {
-            "category": "layout",
-            "severity": "critical",
-            "description": "[Mock] CTA 버튼 너비가 디자인과 다릅니다. 좌우 16px 여백 기준이어야 합니다.",
-            "design_value": f"{dev_w - 32}px",
-            "dev_value": f"{dev_w}px (전체 폭)",
-            "bbox_x": 0,
-            "bbox_y": int(dev_h * 0.85),
-            "bbox_w": dev_w,
-            "bbox_h": int(dev_h * 0.07),
-        },
-        {
-            "category": "color",
-            "severity": "minor",
-            "description": "[Mock] 배경색이 약간 다릅니다.",
-            "design_value": "#F8FAFC",
-            "dev_value": "#FFF1F2",
-            "bbox_x": 0,
-            "bbox_y": 0,
-            "bbox_w": dev_w,
-            "bbox_h": int(dev_h * 0.15),
-        },
-    ]
+def _crop_to_bytes(img_path: str, region: dict, padding: int = 20) -> Optional[bytes]:
+    """이미지에서 특정 영역을 크롭하여 PNG bytes로 반환."""
+    img = Image.open(img_path).convert("RGB")
+    x1 = max(0, region["x"] - padding)
+    y1 = max(0, region["y"] - padding)
+    x2 = min(img.width, region["x"] + region["w"] + padding)
+    y2 = min(img.height, region["y"] + region["h"] + padding)
+
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        return None
+
+    cropped = img.crop((x1, y1, x2, y2))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def analyze_uncovered_regions(
+    design_path: str,
+    dev_path: str,
+    uncovered_regions: List[Dict],
+    dev_width: int,
+    dev_height: int,
+    max_regions: int = 5,
+) -> List[Dict]:
+    """
+    pixel diff가 감지했지만 CV가 커버하지 못한 영역을 Gemini에 크롭하여 분석.
+    전체 이미지 대신 특정 영역만 보내므로 정밀도가 높다.
+    """
+    if not settings.gemini_api_key or settings.gemini_api_key == "your_gemini_api_key_here":
+        return []
+    if not uncovered_regions:
+        return []
+
+    # 면적 큰 순으로 정렬, 상위 N개만 분석 (API 비용 절감)
+    sorted_regions = sorted(uncovered_regions, key=lambda r: r.get("area", 0), reverse=True)
+    targets = sorted_regions[:max_regions]
+
+    all_diffs: List[Dict] = []
+
+    for region in targets:
+        design_crop = _crop_to_bytes(design_path, region)
+        dev_crop = _crop_to_bytes(dev_path, region)
+        if not design_crop or not dev_crop:
+            continue
+
+        design_part = {"mime_type": "image/png", "data": base64.b64encode(design_crop).decode()}
+        dev_part = {"mime_type": "image/png", "data": base64.b64encode(dev_crop).decode()}
+
+        prompt = TARGETED_DIFF_PROMPT.format(
+            rx=region["x"], ry=region["y"],
+            rw=region["w"], rh=region["h"],
+            dev_width=dev_width, dev_height=dev_height,
+        )
+
+        print(f"[Gemini] 타겟 분석: ({region['x']},{region['y']}) {region['w']}×{region['h']}px")
+        raw = _call_gemini(prompt, [design_part, dev_part])
+        if not raw:
+            continue
+
+        parsed = _parse_json(raw)
+        if not parsed:
+            continue
+
+        VALID_CATEGORIES = {"typography", "color", "layout", "missing", "spacing"}
+        VALID_SEVERITIES = {"critical", "major", "minor"}
+
+        for d in parsed:
+            if not isinstance(d, dict) or "description" not in d:
+                continue
+
+            cat = str(d.get("category", "layout")).lower().strip()
+            if cat not in VALID_CATEGORIES:
+                cat = "layout"
+
+            sev = str(d.get("severity", "minor")).lower().strip()
+            if sev not in VALID_SEVERITIES:
+                sev = "minor"
+
+            all_diffs.append({
+                "category": cat,
+                "severity": sev,
+                "description": str(d.get("description", "")),
+                "design_value": str(d.get("design_value", "")),
+                "dev_value": str(d.get("dev_value", "")),
+                "bbox_x": region["x"],
+                "bbox_y": region["y"],
+                "bbox_w": region["w"],
+                "bbox_h": region["h"],
+            })
+
+    print(f"[Gemini] 타겟 분석 결과: {len(all_diffs)}개 (미커버 {len(targets)}개 영역)")
+    return all_diffs

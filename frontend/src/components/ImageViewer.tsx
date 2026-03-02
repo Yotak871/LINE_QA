@@ -5,27 +5,22 @@ import { Layers, SplitSquareHorizontal, ZoomIn, ZoomOut } from "lucide-react";
 import type { Difference, ImageSize } from "@/lib/types";
 
 /* ─── 심각도별 색상 ─────────────────────────────────────── */
-const SEVERITY_FILL: Record<string, string> = {
-  critical: "rgba(224,32,0,0.14)",
-  major:    "rgba(234,88,12,0.14)",
-  minor:    "rgba(202,138,4,0.10)",
-};
 const SEVERITY_STROKE: Record<string, string> = {
   critical: "#e02000",
   major:    "#ea580c",
   minor:    "#ca8a04",
 };
 
-/* 번호 배지 색상 — LINE green 기반 */
+/* 배지 색상 */
 const BADGE_BG = "#06c755";
 const BADGE_ACTIVE_BG = "#e02000";
-const BADGE_APPROVED_BG = "#06c755";
 
 interface Props {
   designUrl:        string;
   devUrl:           string;
   differences:      Difference[];
   activeDiffId:     string | null;
+  hoveredDiffId?:   string | null;
   onSelectDiff:     (id: string) => void;
   devImageSize?:    ImageSize;
   designImageSize?: ImageSize;
@@ -34,7 +29,7 @@ interface Props {
 type ViewMode = "sidebyside" | "overlay";
 
 export default function ImageViewer({
-  designUrl, devUrl, differences, activeDiffId, onSelectDiff,
+  designUrl, devUrl, differences, activeDiffId, hoveredDiffId, onSelectDiff,
   devImageSize, designImageSize,
 }: Props) {
   const [mode, setMode]       = useState<ViewMode>("sidebyside");
@@ -43,6 +38,9 @@ export default function ImageViewer({
 
   const visibleDiffs = differences.filter((d) => d.status !== "ignored");
   const numberedDiffs = visibleDiffs.map((d, i) => ({ ...d, num: i + 1 }));
+
+  /* 포커스 대상: 클릭 > 호버 > 없음 */
+  const focusId = activeDiffId ?? hoveredDiffId ?? null;
 
   const handleOverlayMove = (e: React.MouseEvent<HTMLDivElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
@@ -87,27 +85,29 @@ export default function ImageViewer({
         {mode === "sidebyside" ? (
           <div className="flex gap-4 p-4 min-w-max">
             <AnnotatedImage
-              url={devUrl}
-              label="Beta (개발)"
-              labelCls="bg-line-50 text-line-700 border border-line-200"
-              diffs={numberedDiffs}
-              activeDiffId={activeDiffId}
-              onSelect={onSelectDiff}
-              zoom={zoom}
-              imageSize={devImageSize}
-              showCurrentValue
-            />
-            <AnnotatedImage
               url={designUrl}
-              label="Design (원본)"
-              labelCls="bg-surface-50 text-[#616161] border border-surface-200"
+              label="디자인"
+              labelCls="bg-blue-50 text-blue-700 border border-blue-200"
               diffs={numberedDiffs}
+              focusId={focusId}
               activeDiffId={activeDiffId}
               onSelect={onSelectDiff}
               zoom={zoom}
               imageSize={designImageSize}
               sourceImageSize={devImageSize}
-              showTargetValue
+              showDesignValue
+            />
+            <AnnotatedImage
+              url={devUrl}
+              label="개발"
+              labelCls="bg-line-50 text-line-700 border border-line-200"
+              diffs={numberedDiffs}
+              focusId={focusId}
+              activeDiffId={activeDiffId}
+              onSelect={onSelectDiff}
+              zoom={zoom}
+              imageSize={devImageSize}
+              showDevValue
             />
           </div>
         ) : (
@@ -116,6 +116,7 @@ export default function ImageViewer({
               devUrl={devUrl}
               designUrl={designUrl}
               diffs={numberedDiffs}
+              focusId={focusId}
               activeDiffId={activeDiffId}
               onSelect={onSelectDiff}
               sliderX={sliderX}
@@ -131,24 +132,28 @@ export default function ImageViewer({
 }
 
 /* ═══════════════════════════════════════════════════════════
-   AnnotatedImage — SVG viewBox로 원본 좌표 → 표시 크기 자동 매핑
+   AnnotatedImage — Single Focus Mode
+
+   포커스된 항목만 하이라이트 + 뱃지 + 값 표시
+   비포커스 항목은 아무것도 표시하지 않음 (깨끗한 이미지)
 ═══════════════════════════════════════════════════════════ */
 function AnnotatedImage({
-  url, label, labelCls, diffs, activeDiffId, onSelect, zoom,
+  url, label, labelCls, diffs, focusId, activeDiffId, onSelect, zoom,
   imageSize, sourceImageSize,
-  showCurrentValue, showTargetValue,
+  showDesignValue, showDevValue,
 }: {
   url: string;
   label: string;
   labelCls: string;
   diffs: Array<Difference & { num: number }>;
+  focusId: string | null;
   activeDiffId: string | null;
   onSelect: (id: string) => void;
   zoom: number;
   imageSize?: ImageSize;
   sourceImageSize?: ImageSize;
-  showCurrentValue?: boolean;
-  showTargetValue?: boolean;
+  showDesignValue?: boolean;
+  showDevValue?: boolean;
 }) {
   const imgRef = useRef<HTMLImageElement>(null);
   const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
@@ -162,17 +167,14 @@ function AnnotatedImage({
     return () => img.removeEventListener("load", onLoad);
   }, [url]);
 
-  /* viewBox 크기: API 크기 > naturalSize > 0 */
   const vw = imageSize?.width  ?? naturalSize?.w ?? 0;
   const vh = imageSize?.height ?? naturalSize?.h ?? 0;
 
-  /* Design 이미지용 좌표 스케일링 (dev 기준 bbox → design 비율 변환) */
   const scaleX = sourceImageSize && imageSize
     ? imageSize.width / sourceImageSize.width : 1;
   const scaleY = sourceImageSize && imageSize
     ? imageSize.height / sourceImageSize.height : 1;
 
-  /* 배지 크기 (viewBox 비율 기준) */
   const BADGE_R = vw > 0 ? Math.max(12, Math.min(18, vw * 0.032)) : 14;
 
   return (
@@ -191,35 +193,49 @@ function AnnotatedImage({
             viewBox={`0 0 ${vw} ${vh}`}
             preserveAspectRatio="none"
             xmlns="http://www.w3.org/2000/svg"
-            style={{ pointerEvents: "none" }}
+            style={{ pointerEvents: "none", overflow: "visible" }}
           >
             {diffs.map((d) => {
+              const isFocused  = focusId === d.id;
               const isActive   = activeDiffId === d.id;
-              const isApproved = d.status === "approved";
-              const fill   = isActive ? "rgba(6,199,85,0.18)" : SEVERITY_FILL[d.severity];
-              const stroke = isActive ? "#06c755" : SEVERITY_STROKE[d.severity];
-              const sw     = isActive ? 3 : 2;
 
-              const bx = d.bbox_x * scaleX;
-              const by = d.bbox_y * scaleY;
-              const bw = d.bbox_w * scaleX;
-              const bh = d.bbox_h * scaleY;
+              // 디자인 패널: design_bbox가 유효하면 직접 사용 (원본 디자인 좌표)
+              // 유효하지 않으면 (이전 데이터, 0값) bbox에 스케일 적용으로 fallback
+              const hasDesignBbox = showDesignValue
+                && d.design_bbox_w != null && d.design_bbox_h != null
+                && d.design_bbox_w > 0 && d.design_bbox_h > 0;
+              const bx = hasDesignBbox ? d.design_bbox_x! : d.bbox_x * scaleX;
+              const by = hasDesignBbox ? d.design_bbox_y! : d.bbox_y * scaleY;
+              const bw = hasDesignBbox ? d.design_bbox_w! : d.bbox_w * scaleX;
+              const bh = hasDesignBbox ? d.design_bbox_h! : d.bbox_h * scaleY;
 
-              const valLabel = showCurrentValue ? d.dev_value
-                : showTargetValue ? d.design_value : null;
+              const stroke = SEVERITY_STROKE[d.severity] ?? "#e02000";
 
-              const badgeX = Math.max(BADGE_R, bx);
-              const badgeY = Math.max(BADGE_R, by);
+              /* ── 포커스되지 않은 항목: 아무것도 표시하지 않음 ── */
+              if (!isFocused) return <g key={d.id} />;
+
+              /* ── 포커스된 항목: 풀 하이라이트 + 뱃지 + 값 ── */
+              const fillColor = isActive ? "rgba(6,199,85,0.18)" : "rgba(224,32,0,0.10)";
+              const strokeColor = isActive ? "#06c755" : stroke;
+              const sw = isActive ? 3 : 2.5;
+
+              const badgeCx = bx - BADGE_R * 0.35;
+              const badgeCy = by - BADGE_R * 0.35;
+              const badgeFill = isActive ? BADGE_ACTIVE_BG : BADGE_BG;
+
+              const valLabel = showDesignValue ? d.design_value
+                : showDevValue ? d.dev_value : null;
               const fontSize = Math.max(10, vw * 0.024);
 
               return (
                 <g key={d.id} style={{ pointerEvents: "all", cursor: "pointer" }}
                   onClick={() => onSelect(d.id)}>
-                  {/* 영역 하이라이트 */}
+                  {/* 하이라이트 영역 */}
                   <rect x={bx} y={by} width={bw} height={bh}
-                    fill={fill} stroke={stroke} strokeWidth={sw} rx={4} />
+                    fill={fillColor} stroke={strokeColor} strokeWidth={sw}
+                    rx={4} strokeDasharray={isActive ? "none" : "6 3"} />
 
-                  {/* 값 레이블 */}
+                  {/* 값 라벨 (영역 중앙) */}
                   {valLabel && (
                     <g>
                       <rect
@@ -227,7 +243,7 @@ function AnnotatedImage({
                         y={by + bh / 2 - fontSize * 0.7}
                         width={Math.max(valLabel.length * 8, 36)}
                         height={fontSize * 1.6}
-                        rx={4} fill={stroke} opacity={0.88} />
+                        rx={4} fill={strokeColor} opacity={0.88} />
                       <text x={bx + bw / 2} y={by + bh / 2 + fontSize * 0.35}
                         textAnchor="middle" fontSize={fontSize}
                         fontWeight={700} fill="white">
@@ -236,15 +252,14 @@ function AnnotatedImage({
                     </g>
                   )}
 
-                  {/* 번호 배지 */}
-                  <circle cx={badgeX - BADGE_R + 3} cy={badgeY - BADGE_R + 3}
-                    r={BADGE_R}
-                    fill={isApproved ? BADGE_APPROVED_BG : isActive ? BADGE_ACTIVE_BG : BADGE_BG}
-                    stroke="white" strokeWidth={2} />
-                  <text x={badgeX - BADGE_R + 3}
-                    y={badgeY - BADGE_R + 3 + BADGE_R * 0.38}
-                    textAnchor="middle" fontSize={BADGE_R * 0.9}
-                    fontWeight={700} fill="white">
+                  {/* 넘버 배지 */}
+                  <circle cx={badgeCx} cy={badgeCy + 1} r={BADGE_R + 1}
+                    fill="rgba(0,0,0,0.18)" />
+                  <circle cx={badgeCx} cy={badgeCy} r={BADGE_R}
+                    fill={badgeFill} stroke="white" strokeWidth={2.5} />
+                  <text x={badgeCx} y={badgeCy + BADGE_R * 0.36}
+                    textAnchor="middle" fontSize={BADGE_R * 0.95}
+                    fontWeight={800} fill="white">
                     {d.num}
                   </text>
                 </g>
@@ -258,14 +273,15 @@ function AnnotatedImage({
 }
 
 /* ═══════════════════════════════════════════════════════════
-   OverlayView — 슬라이더 비교 모드
+   OverlayView — 슬라이더 비교 모드 (동일한 포커스 로직)
 ═══════════════════════════════════════════════════════════ */
 function OverlayView({
-  devUrl, designUrl, diffs, activeDiffId, onSelect,
+  devUrl, designUrl, diffs, focusId, activeDiffId, onSelect,
   sliderX, onMouseMove, zoom, imageSize,
 }: {
   devUrl: string; designUrl: string;
   diffs: Array<Difference & { num: number }>;
+  focusId: string | null;
   activeDiffId: string | null;
   onSelect: (id: string) => void;
   sliderX: number;
@@ -293,7 +309,7 @@ function OverlayView({
     <div className="relative select-none cursor-col-resize inline-block rounded-lg overflow-hidden shadow-sm"
       style={{ transform: `scale(${zoom})`, transformOrigin: "top left" }}
       onMouseMove={onMouseMove}>
-      <img ref={imgRef} src={devUrl} alt="beta" className="block max-w-full" draggable={false} />
+      <img ref={imgRef} src={devUrl} alt="dev" className="block max-w-full" draggable={false} />
       <div className="absolute inset-0 overflow-hidden" style={{ width: `${sliderX}%` }}>
         <img src={designUrl} alt="design" className="block max-w-none"
           style={{ width: `${10000 / sliderX}%` }} draggable={false} />
@@ -307,22 +323,32 @@ function OverlayView({
       {vw > 0 && vh > 0 && (
         <svg className="absolute inset-0 w-full h-full"
           viewBox={`0 0 ${vw} ${vh}`} preserveAspectRatio="none"
-          style={{ pointerEvents: "none" }}>
+          style={{ pointerEvents: "none", overflow: "visible" }}>
           {diffs.map((d) => {
-            const isActive = activeDiffId === d.id;
-            const badgeX = Math.max(BADGE_R, d.bbox_x);
-            const badgeY = Math.max(BADGE_R, d.bbox_y);
+            const isFocused = focusId === d.id;
+            const isActive  = activeDiffId === d.id;
+            const stroke = SEVERITY_STROKE[d.severity] ?? "#e02000";
+
+            if (!isFocused) return <g key={d.id} />;
+
+            const fillColor = isActive ? "rgba(6,199,85,0.18)" : "rgba(224,32,0,0.10)";
+            const strokeColor = isActive ? "#06c755" : stroke;
+            const badgeCx = d.bbox_x - BADGE_R * 0.35;
+            const badgeCy = d.bbox_y - BADGE_R * 0.35;
+
             return (
               <g key={d.id} style={{ pointerEvents: "all", cursor: "pointer" }}
                 onClick={() => onSelect(d.id)}>
                 <rect x={d.bbox_x} y={d.bbox_y} width={d.bbox_w} height={d.bbox_h}
-                  fill={isActive ? "rgba(6,199,85,0.18)" : "rgba(6,199,85,0.08)"}
-                  stroke={isActive ? BADGE_ACTIVE_BG : BADGE_BG}
-                  strokeWidth={isActive ? 3 : 2} rx={4} />
-                <circle cx={badgeX - BADGE_R + 3} cy={badgeY - BADGE_R + 3} r={BADGE_R}
-                  fill={isActive ? BADGE_ACTIVE_BG : BADGE_BG} stroke="white" strokeWidth={2} />
-                <text x={badgeX - BADGE_R + 3} y={badgeY - BADGE_R + 3 + BADGE_R * 0.38}
-                  textAnchor="middle" fontSize={BADGE_R * 0.9} fontWeight={700} fill="white">
+                  fill={fillColor} stroke={strokeColor} strokeWidth={2.5} rx={4} />
+                <circle cx={badgeCx} cy={badgeCy + 1} r={BADGE_R + 1}
+                  fill="rgba(0,0,0,0.18)" />
+                <circle cx={badgeCx} cy={badgeCy} r={BADGE_R}
+                  fill={isActive ? BADGE_ACTIVE_BG : BADGE_BG}
+                  stroke="white" strokeWidth={2.5} />
+                <text x={badgeCx} y={badgeCy + BADGE_R * 0.36}
+                  textAnchor="middle" fontSize={BADGE_R * 0.95}
+                  fontWeight={800} fill="white">
                   {d.num}
                 </text>
               </g>
@@ -331,8 +357,8 @@ function OverlayView({
         </svg>
       )}
 
-      <div className="absolute top-2 left-2 bg-line-50 text-line-700 text-xs px-2 py-0.5 rounded-full font-semibold pointer-events-none border border-line-200">Beta</div>
-      <div className="absolute top-2 right-2 bg-surface-50 text-[#616161] text-xs px-2 py-0.5 rounded-full font-semibold pointer-events-none border border-surface-200">Design</div>
+      <div className="absolute top-2 left-2 bg-line-50 text-line-700 text-xs px-2 py-0.5 rounded-full font-semibold pointer-events-none border border-line-200">개발</div>
+      <div className="absolute top-2 right-2 bg-blue-50 text-blue-700 text-xs px-2 py-0.5 rounded-full font-semibold pointer-events-none border border-blue-200">디자인</div>
     </div>
   );
 }

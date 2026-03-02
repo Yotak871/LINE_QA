@@ -46,13 +46,16 @@ def scale_regions_to_original(
 
     scaled = []
     for r in regions:
-        scaled.append({
+        sr = {
             "x": int(r["x"] * sx),
             "y": int(r["y"] * sy),
             "w": int(r["w"] * sx),
             "h": int(r["h"] * sy),
             "area": int(r.get("area", 0) * sx * sy),
-        })
+        }
+        if "sensitivity" in r:
+            sr["sensitivity"] = r["sensitivity"]
+        scaled.append(sr)
     return scaled
 
 

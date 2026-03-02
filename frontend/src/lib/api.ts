@@ -1,21 +1,35 @@
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
-export async function startAnalysis(designFile: File, devFile: File) {
+export async function startAnalysis(
+  designFile: File,
+  devFile: File,
+  figmaUrl?: string,
+) {
   const form = new FormData();
   form.append("design_image", designFile);
   form.append("dev_image", devFile);
+  if (figmaUrl) {
+    form.append("figma_url", figmaUrl);
+  }
+  form.append("pipeline", "auto");
   const res = await fetch(`${BASE}/api/analyze`, { method: "POST", body: form });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail ?? "업로드 실패");
   }
-  return res.json() as Promise<{ analysis_id: string; status: string }>;
+  return res.json() as Promise<{ analysis_id: string; status: string; pipeline_version?: string }>;
 }
 
 export async function getStatus(id: string) {
   const res = await fetch(`${BASE}/api/analyze/${id}/status`);
   if (!res.ok) throw new Error("상태 조회 실패");
-  return res.json() as Promise<{ status: string; similarity_score: number | null; error_message: string | null }>;
+  return res.json() as Promise<{
+    status: string;
+    progress_step?: string;
+    similarity_score: number | null;
+    pipeline_version?: string;
+    error_message: string | null;
+  }>;
 }
 
 export async function getResult(id: string) {

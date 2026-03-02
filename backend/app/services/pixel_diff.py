@@ -9,12 +9,16 @@ from skimage.metrics import structural_similarity as ssim
 
 def compute_diff(img_a: np.ndarray, img_b: np.ndarray) -> tuple[float, list[dict]]:
     """
-    두 이미지의 픽셀 차이를 분석한다.
-    큰 영역을 자동으로 세분화하여 개별 UI 요소 단위의 차이를 감지한다.
+    두 이미지의 픽셀 차이를 다단계 민감도로 분석한다.
+
+    Google Design QA 수준의 정밀 감지:
+    - Pass 1: 구조적 차이 (레이아웃, 누락 요소)  — 높은 threshold
+    - Pass 2: 세부 차이 (간격, 폰트, 색상)        — 낮은 threshold
+    - Pass 3: 에지 차이 (정확한 마진/패딩 감지)    — Canny edge diff
 
     Returns:
         similarity_score: 0~100 유사도 점수
-        regions: 차이 영역 바운딩 박스 목록 [{x, y, w, h, area}, ...]
+        regions: 차이 영역 바운딩 박스 목록 [{x, y, w, h, area, sensitivity}, ...]
     """
     gray_a = cv2.cvtColor(img_a, cv2.COLOR_RGB2GRAY)
     gray_b = cv2.cvtColor(img_b, cv2.COLOR_RGB2GRAY)
@@ -24,53 +28,112 @@ def compute_diff(img_a: np.ndarray, img_b: np.ndarray) -> tuple[float, list[dict
     score, diff = ssim(gray_a, gray_b, full=True)
     similarity = round(float(score) * 100, 2)
 
-    # 차이 영역 추출 (더 낮은 threshold로 미세한 차이도 감지)
     diff_uint8 = (np.abs(1 - diff) * 255).astype(np.uint8)
-    _, thresh = cv2.threshold(diff_uint8, 25, 255, cv2.THRESH_BINARY)
 
-    # 1단계: 작은 커널로 노이즈만 제거 (세부 영역 보존)
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_small)
+    all_regions = []
 
-    # 2단계: 약간의 dilation으로 가까운 픽셀 연결 (같은 요소 내 차이)
-    kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 5))
-    connected = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_connect)
+    # ─── Pass 1: 구조적 차이 (큰 레이아웃 변경, 누락 요소) ───
+    _, thresh_structural = cv2.threshold(diff_uint8, 30, 255, cv2.THRESH_BINARY)
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    thresh_structural = cv2.morphologyEx(thresh_structural, cv2.MORPH_OPEN, kernel_open)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 7))
+    connected = cv2.morphologyEx(thresh_structural, cv2.MORPH_CLOSE, kernel_close)
 
     contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    raw_regions = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 80:  # 노이즈 제외
+        if area < 100:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
-        raw_regions.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "area": int(area)})
+        all_regions.append({
+            "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+            "area": int(area), "sensitivity": "structural",
+        })
 
-    # 3단계: 큰 영역을 세분화 (화면의 15% 이상이면 분할 시도)
+    # ─── Pass 2: 세부 차이 (간격, 색상, 타이포) ───
+    _, thresh_detail = cv2.threshold(diff_uint8, 12, 255, cv2.THRESH_BINARY)
+    kernel_open_s = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    thresh_detail = cv2.morphologyEx(thresh_detail, cv2.MORPH_OPEN, kernel_open_s)
+    kernel_close_s = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    connected_detail = cv2.morphologyEx(thresh_detail, cv2.MORPH_CLOSE, kernel_close_s)
+
+    contours_d, _ = cv2.findContours(connected_detail, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours_d:
+        area = cv2.contourArea(cnt)
+        if area < 30:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        # Pass 1에서 이미 감지된 영역과 겹치는지 확인
+        r = {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "area": int(area)}
+        if not _covered_by(r, all_regions, coverage=0.7):
+            r["sensitivity"] = "detail"
+            all_regions.append(r)
+
+    # ─── Pass 3: 에지 기반 차이 (마진/패딩/보더 정밀 감지) ───
+    edges_a = cv2.Canny(gray_a, 50, 150)
+    edges_b = cv2.Canny(gray_b, 50, 150)
+    edge_diff = cv2.absdiff(edges_a, edges_b)
+
+    kernel_edge = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edge_diff = cv2.morphologyEx(edge_diff, cv2.MORPH_CLOSE, kernel_edge)
+
+    contours_e, _ = cv2.findContours(edge_diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours_e:
+        area = cv2.contourArea(cnt)
+        if area < 20:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        r = {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "area": int(area)}
+        if not _covered_by(r, all_regions, coverage=0.6):
+            r["sensitivity"] = "edge"
+            all_regions.append(r)
+
+    # ─── 후처리: 분할 → 병합 → 정렬 ───
     MAX_REGION_RATIO = 0.15
-    regions = []
-    for r in raw_regions:
+    final_regions = []
+    for r in all_regions:
         r_area = r["w"] * r["h"]
         if r_area > total_area * MAX_REGION_RATIO:
-            sub_regions = _split_large_region(thresh, r, img_w, img_h)
+            sub_regions = _split_large_region(thresh_detail, r, img_w, img_h)
             if len(sub_regions) > 1:
-                regions.extend(sub_regions)
+                for sr in sub_regions:
+                    sr["sensitivity"] = r.get("sensitivity", "structural")
+                final_regions.extend(sub_regions)
             else:
-                regions.append(r)
+                final_regions.append(r)
         else:
-            regions.append(r)
+            final_regions.append(r)
 
-    # 4단계: 겹치는 영역 병합
-    regions = _merge_overlapping(regions)
+    final_regions = _merge_overlapping(final_regions)
+    final_regions.sort(key=lambda r: r["area"], reverse=True)
+    final_regions = final_regions[:20]  # 최대 20개 (기존 15 → 20)
 
-    # 면적 기준 내림차순 정렬
-    regions.sort(key=lambda r: r["area"], reverse=True)
+    structural_count = sum(1 for r in final_regions if r.get("sensitivity") == "structural")
+    detail_count = sum(1 for r in final_regions if r.get("sensitivity") == "detail")
+    edge_count = sum(1 for r in final_regions if r.get("sensitivity") == "edge")
+    print(
+        f"[PixelDiff] 유사도: {similarity}%, "
+        f"감지 영역: {len(all_regions)}개 → 최종: {len(final_regions)}개 "
+        f"(구조:{structural_count} 세부:{detail_count} 에지:{edge_count})"
+    )
+    return similarity, final_regions
 
-    # 최대 15개로 제한
-    regions = regions[:15]
 
-    print(f"[PixelDiff] 유사도: {similarity}%, 감지 영역: {len(raw_regions)}개 → 세분화 후: {len(regions)}개")
-    return similarity, regions
+def _covered_by(r: dict, existing: list[dict], coverage: float = 0.7) -> bool:
+    """r이 existing 영역들에 의해 일정 비율 이상 커버되는지 확인."""
+    r_area = r["w"] * r["h"]
+    if r_area <= 0:
+        return True
+    for e in existing:
+        ix1 = max(r["x"], e["x"])
+        iy1 = max(r["y"], e["y"])
+        ix2 = min(r["x"] + r["w"], e["x"] + e["w"])
+        iy2 = min(r["y"] + r["h"], e["y"] + e["h"])
+        if ix2 > ix1 and iy2 > iy1:
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            if inter / r_area >= coverage:
+                return True
+    return False
 
 
 def _split_large_region(
@@ -81,19 +144,14 @@ def _split_large_region(
     x2 = min(x + w, img_w)
     y2 = min(y + h, img_h)
 
-    # 해당 영역만 크롭
     roi = thresh[y:y2, x:x2]
     if roi.size == 0:
         return [region]
 
-    # 수평 프로젝션 (각 행의 흰 픽셀 수)
     h_proj = np.sum(roi > 0, axis=1)
-
-    # 빈 행(차이 없는 행)을 찾아서 분할 포인트 결정
-    gap_threshold = w * 0.03  # 행의 3% 미만이면 "빈 행"으로 간주
+    gap_threshold = w * 0.03
     is_gap = h_proj < gap_threshold
 
-    # 연속된 빈 행이 5px 이상이면 분할 포인트
     MIN_GAP = 5
     sub_regions = []
     start = 0
@@ -104,7 +162,6 @@ def _split_large_region(
             gap_count += 1
         else:
             if gap_count >= MIN_GAP and row - gap_count > start:
-                # 이전 세그먼트 저장
                 seg_roi = roi[start:row - gap_count, :]
                 if np.sum(seg_roi > 0) > 50:
                     sub = _tight_bbox(seg_roi, x, y + start)
@@ -113,7 +170,6 @@ def _split_large_region(
                 start = row
             gap_count = 0
 
-    # 마지막 세그먼트
     if start < len(is_gap):
         seg_roi = roi[start:, :]
         if np.sum(seg_roi > 0) > 50:
@@ -121,7 +177,6 @@ def _split_large_region(
             if sub:
                 sub_regions.append(sub)
 
-    # 분할 결과가 1개 이하면 수직 분할도 시도
     if len(sub_regions) <= 1:
         sub_regions = _split_vertical(roi, x, y)
 
@@ -169,7 +224,6 @@ def _tight_bbox(roi: np.ndarray, offset_x: int, offset_y: int) -> Optional[dict]
     if coords is None:
         return None
     bx, by, bw, bh = cv2.boundingRect(coords)
-    # 약간의 패딩 추가
     pad = 4
     bx = max(0, bx - pad)
     by = max(0, by - pad)
@@ -204,7 +258,6 @@ def _merge_overlapping(regions: list[dict], iou_threshold: float = 0.3) -> list[
                 group.append(b)
                 used.add(j)
 
-        # 그룹 내 모든 영역을 하나로 병합
         if len(group) == 1:
             merged.append(group[0])
         else:
@@ -212,10 +265,14 @@ def _merge_overlapping(regions: list[dict], iou_threshold: float = 0.3) -> list[
             min_y = min(g["y"] for g in group)
             max_x = max(g["x"] + g["w"] for g in group)
             max_y = max(g["y"] + g["h"] for g in group)
+            # 병합 시 가장 높은 sensitivity 유지
+            sens_priority = {"structural": 0, "detail": 1, "edge": 2}
+            best_sens = min(group, key=lambda g: sens_priority.get(g.get("sensitivity", "structural"), 0))
             merged.append({
                 "x": min_x, "y": min_y,
                 "w": max_x - min_x, "h": max_y - min_y,
                 "area": sum(g["area"] for g in group),
+                "sensitivity": best_sens.get("sensitivity", "structural"),
             })
         used.add(i)
 

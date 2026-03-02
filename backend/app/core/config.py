@@ -4,6 +4,7 @@ from pathlib import Path
 
 class Settings(BaseSettings):
     gemini_api_key: str = ""
+    figma_access_token: str = ""
     database_url: str = "sqlite+aiosqlite:///./designsync.db"
     upload_dir: str = "./uploads"
     frontend_url: str = "http://localhost:3000"

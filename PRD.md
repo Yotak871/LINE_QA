@@ -1,10 +1,11 @@
 # PRD: DesignSync — AI-Powered Design QA Automation
 
-**Version:** 2.2
-**Date:** 2026-02-27
+**Version:** 2.3
+**Date:** 2026-02-28
 **Author:** Product Team
 **Status:** MVP Development In Progress
 
+> v2.3 변경: CV+AI 하이브리드 파이프라인 아키텍처 전환, 듀얼 bbox 좌표 시스템, element_analyzer v2 (히스토그램 매칭), 상태바 트리밍 알고리즘
 > v2.2 변경: 구현 현황 문서화, 프로젝트 구조/실행 가이드/트러블슈팅 추가, Pixel Diff 세분화 알고리즘 스펙 추가
 > v2.1 변경: bbox 좌표 시스템 명세 추가, Gemini Vision API 연동 확정, SVG viewBox 매핑 스펙 추가
 > v2.0 변경: 블로커 5개 해소 (기술 스택 확정 / Auth MVP 포함 / 과금 모델 수정 / Approve 워크플로우 추가 / 정확도 정의 추가)
@@ -395,7 +396,8 @@ share_links (
 | Canvas / 마킹 | Konva.js | react-konva |
 | Backend | FastAPI (Python 3.11) | |
 | 이미지 처리 | Pillow + OpenCV | |
-| AI / Vision | Google Gemini 2.0 Flash | 무료 티어, 추후 Claude 교체 가능 |
+| CV 분석 | OpenCV + scikit-image (SSIM) | 간격/마진/높이 정밀 측정 |
+| AI / Vision | Google Gemini 2.5 Flash | 밴드 라벨링 + 시각적 차이 감지 |
 | Job Queue | FastAPI BackgroundTasks | 로컬 MVP용, 추후 Celery 전환 |
 | Storage | 로컬 파일시스템 | 로컬 MVP용, 추후 S3 전환 |
 | DB | SQLite + SQLAlchemy | 로컬 MVP용, 추후 PostgreSQL 전환 |
@@ -512,9 +514,10 @@ LINE_QA/
 │       │   ├── analyze.py       # 분석 API (업로드, 상태조회, 결과, 차이점 상태변경)
 │       │   └── share.py         # 공유 링크 API (생성, 조회)
 │       └── services/
-│           ├── image_processor.py  # 이미지 정규화, 크기 조회, 좌표 스케일링
-│           ├── pixel_diff.py       # SSIM 기반 픽셀 비교 + 영역 세분화
-│           └── gemini_analyzer.py  # Gemini Vision API 분석 + 모델 폴백 체인
+│           ├── image_processor.py    # 이미지 정규화, 크기 조회, 좌표 스케일링
+│           ├── pixel_diff.py         # SSIM 기반 픽셀 비교 + 영역 세분화
+│           ├── element_analyzer.py   # CV 측정 엔진 v2 (히스토그램 매칭, 듀얼 bbox)
+│           └── gemini_analyzer.py    # AI 라벨링 + 비-간격 차이 감지
 └── frontend/                    # Next.js 14 프론트엔드
     ├── next.config.mjs          # Next.js 설정 (API 리라이트 프록시)
     ├── tailwind.config.ts       # Tailwind 설정 (brand 색상 확장)
@@ -540,14 +543,17 @@ LINE_QA/
 | 기능 | 상태 | 비고 |
 |------|------|------|
 | F-02 이미지 업로드 | ✅ 완료 | D&D + 클릭, PNG/JPG/WebP, 20MB 제한 |
-| F-03 AI 차이점 분석 | ✅ 완료 | Gemini Vision + Pixel diff 폴백 |
-| F-04 심각도 분류 | ✅ 완료 | Critical/Major/Minor 자동 분류 |
-| F-05 결과 시각화 | ✅ 완료 | Side-by-side, Overlay 슬라이더, 줌 |
+| F-03 AI 차이점 분석 | ✅ 완료 | CV+AI 하이브리드 (CV 측정 + Gemini 라벨링) |
+| F-04 심각도 분류 | ✅ 완료 | 비례적 심각도 (절대 px + 상대 비율 결합) |
+| F-05 결과 시각화 | ✅ 완료 | Side-by-side, 듀얼 bbox, Single Focus Mode |
 | F-06 Approve/Ignore | ✅ 완료 | 상태 변경 API + UI 반영 |
-| F-07 리포트 생성 | ✅ 완료 | 요약 카드, 유사도 점수, 수치 표시 |
+| F-07 리포트 생성 | ✅ 완료 | 요약 카드, 유사도 점수, 기준값/실제값 칩 |
 | F-08 공유 링크 | ✅ 완료 | short_id 기반, 만료일 설정 |
 | F-01 사용자 인증 | ❌ 미구현 | Google OAuth (NextAuth.js) |
 | 데모 페이지 | ✅ 완료 | 목업 데이터로 즉시 체험 |
+| CV 측정 엔진 v2 | ✅ 완료 | 히스토그램 매칭, 상태바 트리밍, 듀얼 bbox |
+| 듀얼 bbox 시스템 | ✅ 완료 | 전체 스택 (CV → API → DB → Frontend) |
+| Single Focus Mode | ✅ 완료 | 선택 항목만 하이라이트, 자동 #1 선택 |
 
 ### 13.3 개발 환경 설정 & 실행 방법
 
@@ -630,7 +636,9 @@ npm run dev   # http://localhost:3000
 
 ## 14. 핵심 기술 아키텍처 상세
 
-### 14.1 AI 분석 파이프라인 (실제 구현)
+### 14.1 CV+AI 하이브리드 분석 파이프라인 (v2.3 전면 개편)
+
+**설계 원칙:** 측정은 CV(정확한 px 값), 이해는 AI(의미론적 라벨링). LLM에 픽셀 측정을 맡기지 않는다.
 
 ```
 Input: [Design Image] + [Dev Screenshot]
@@ -640,34 +648,41 @@ Input: [Design Image] + [Dev Screenshot]
   get_image_dimensions(dev_path) → (dev_w, dev_h)
         │
         ▼
-[Step 2] 이미지 정규화 + 픽셀 비교
-  load_and_normalize(design_path, dev_path) → (img_a, img_b, orig_a_size, orig_b_size)
-  ※ 작은 쪽 기준 리사이즈 (비율 유지 아닌 강제 리사이즈)
-  compute_diff(img_a, img_b) → (similarity_score, regions)
-  ※ SSIM + 영역 세분화 알고리즘 적용
+[Step 2] 이미지 정규화 + 픽셀 비교 (유사도 점수용)
+  load_and_normalize() → compute_diff() → similarity_score
         │
         ▼
-[Step 3] 좌표 스케일링 (정규화 → 원본)
-  scale_regions_to_original(regions, norm_w, norm_h, dev_w, dev_h)
-  ※ norm 좌표 × (orig / norm) 비율로 변환
+[Step 3] CV 기반 정밀 측정 — element_analyzer v2
+  detect_and_compare(design_path, dev_path) → (cv_diffs, design_bands, dev_bands)
+  ├── 스마트 정규화 (너비 기준, 비율 유지)
+  ├── Horizontal Projection Profile → 콘텐츠 밴드 감지
+  ├── 상태바 트리밍 (_trim_status_bar, 상단 7% 영역)
+  ├── 히스토그램 유사도 + DP 순서보존 매칭 (시각 40%+위치 30%+높이 30%)
+  └── 듀얼 bbox 생성 (bbox_* = dev, design_bbox_* = design)
         │
         ▼
-[Step 4] Gemini Vision AI 분석 (모델 폴백 체인)
-  analyze_with_gemini(design_path, dev_path, scaled_regions, dev_w, dev_h)
-  ├── 시도 1: gemini-2.0-flash-lite
-  ├── 시도 2: gemini-2.0-flash
-  ├── 시도 3: gemini-1.5-flash-latest
-  ├── 시도 4: gemini-1.5-pro-latest
-  └── 모두 실패 시: _fallback_from_regions() (Pixel diff 폴백)
+[Step 4] Gemini AI 분석
+  ├── 4a: label_bands() → 밴드에 의미론적 이름 부여 ("헤더", "네비게이션" 등)
+  ├── 4b: format_differences_with_labels() → CV 측정 + AI 라벨 결합
+  ├── 4b-2: design_bbox 좌표를 원본 디자인 공간으로 변환 (scale_back)
+  └── 4c: find_visual_diffs() → 비-간격 차이 (색상, 타이포, 누락 요소) AI 감지
         │
         ▼
-[Step 5] 마킹 이미지 생성
-  save_marked_image(dev_path, diff_data, marked_path)
-  ※ 원본 dev 이미지 위에 심각도별 색상 bbox 오버레이
+[Step 5] 결과 통합 — CV 측정(정확) + AI 시각 분석(보완)
+  diff_data = spacing_diffs + visual_diffs
         │
         ▼
-[Step 6] DB 저장 → 상태 "done" 업데이트
+[Step 6] 마킹 이미지 생성 + DB 저장 (듀얼 bbox 포함)
 ```
+
+**vs 이전 파이프라인:**
+| 항목 | v2.2 (이전) | v2.3 (현재) |
+|------|-----------|-----------|
+| 간격/높이 측정 | Gemini AI (부정확) | CV 히스토그램 매칭 (정확) |
+| 밴드 라벨링 | 없음 | Gemini AI (의미론적 이름) |
+| bbox 좌표 | dev 좌표 1세트 | 듀얼 bbox (dev + design) |
+| 상태바 처리 | 없음 → 오탐 발생 | 트리밍 (상단 7%) |
+| 비-간격 차이 | Gemini 전체 | Gemini (색상, 타이포, 누락) |
 
 ### 14.2 Pixel Diff 세분화 알고리즘
 
@@ -698,32 +713,73 @@ Input: [Design Image] + [Dev Screenshot]
 - 이전: 화면 전체를 덮는 1개 거대 영역
 - 이후: 헤더/콘텐츠/푸터 등 UI 영역별로 3~10개 세분화된 영역
 
-### 14.3 Annotation 좌표 시스템 (Frontend)
+### 14.2b element_analyzer v2 알고리즘 (v2.3 추가)
+
+간격/마진/높이를 정밀하게 측정하는 CV 기반 엔진:
 
 ```
-┌── 핵심 원칙 ──────────────────────────────────────────────────┐
-│ 모든 bbox 좌표는 DEV(개발) 이미지의 원본 픽셀 기준이다.       │
-│ Design 이미지에 표시할 때는 비율 스케일링으로 매핑한다.        │
-└───────────────────────────────────────────────────────────────┘
+[1단계] 스마트 정규화
+  - dev 이미지 너비 기준으로 design 리사이즈 (비율 유지)
+  - 높이가 다르면 짧은 쪽에 맞춤
 
-[ImageViewer.tsx 핵심 구조]
+[2단계] Horizontal Projection Profile → 콘텐츠 밴드 감지
+  - 각 행의 비-배경 픽셀 수 계산
+  - threshold 기반으로 콘텐츠 밴드(시작/끝/높이) 추출
+  - 밴드: UI 요소의 수평 영역 (헤더, 네비, 카드, 버튼 등)
 
-  <div style={{ transform: `scale(${zoom})` }}>
-    <img ref={imgRef} src={url} />    ← 이미지 원본 크기로 렌더링
-    <svg
-      viewBox={`0 0 ${vw} ${vh}`}     ← viewBox = 이미지 원본 크기
-      class="absolute inset-0 w-full h-full"
-    >
-      <rect x={bbox_x} y={bbox_y} ... />    ← 원본 픽셀 좌표 그대로
-      <circle cx={badgeX} cy={badgeY} />     ← 번호 배지
-    </svg>
-  </div>
+[3단계] 상태바 트리밍
+  - _trim_status_bar(): 상단 7% 경계에서 밴드를 잘라냄
+  - 경계를 걸치는 밴드는 아래쪽만 유지 (height < 10px면 제거)
 
-[Design 이미지 좌표 변환]
-  scaleX = design_width / dev_width
-  scaleY = design_height / dev_height
-  design_bbox_x = bbox_x × scaleX
-  design_bbox_y = bbox_y × scaleY
+[4단계] 히스토그램 유사도 + DP 순서보존 매칭
+  - 각 밴드의 색상 히스토그램 계산
+  - 매칭 스코어 = 시각 유사도(40%) + 위치 근접성(30%) + 높이 유사성(30%)
+  - DP로 순서를 보존하면서 최적 매칭 (삭제/추가 허용)
+
+[5단계] 차이 비교 (높은 임계값)
+  - vertical_spacing: 밴드 사이 간격 차이 (임계값: 4px)
+  - element_height: 개별 밴드 높이 차이 (임계값: 5px)
+  - top/bottom/left/right_margin: 여백 차이 (임계값: 4px)
+
+[6단계] 듀얼 bbox 생성
+  - bbox_*: dev 밴드의 좌표
+  - design_bbox_*: design 밴드의 좌표
+  - 비례적 심각도: 절대 px 차이 + 상대 비율 결합
+
+[7단계] 겹치는 차이 병합
+```
+
+### 14.3 듀얼 Bbox 좌표 시스템 (v2.3 개편)
+
+```
+┌── 핵심 원칙 (v2.3) ──────────────────────────────────────────────┐
+│ 각 차이에 두 세트의 좌표가 저장된다:                               │
+│  - bbox_*        → dev 이미지 원본 픽셀 좌표 (개발 패널용)         │
+│  - design_bbox_* → 원본 디자인 이미지 픽셀 좌표 (디자인 패널용)    │
+│ Gemini visual_diffs는 design_bbox 없음 → 0 저장 → fallback 적용   │
+└────────────────────────────────────────────────────────────────────┘
+
+[좌표 변환 흐름]
+  element_analyzer: 정규화 공간(dev 너비 기준)에서 양쪽 bbox 생성
+    ↓
+  analyze.py: design_bbox를 원본 디자인 좌표로 변환
+    scale_back = design_w_orig / dev_w
+    design_bbox_x = int(design_bbox_x * scale_back)
+    ↓
+  DB: bbox_x/y/w/h + design_bbox_x/y/w/h 컬럼 저장
+    ↓
+  Frontend: design_bbox_w > 0 && design_bbox_h > 0 이면 직접 사용
+            아니면 bbox * scaleX/scaleY로 fallback
+
+[ImageViewer.tsx 핵심 로직]
+
+  // Dev 패널: bbox 좌표 그대로
+  <rect x={bbox_x} y={bbox_y} width={bbox_w} height={bbox_h} />
+
+  // Design 패널: 듀얼 bbox 또는 fallback
+  const hasDesignBbox = d.design_bbox_w > 0 && d.design_bbox_h > 0;
+  const bx = hasDesignBbox ? d.design_bbox_x : d.bbox_x * scaleX;
+  const by = hasDesignBbox ? d.design_bbox_y : d.bbox_y * scaleY;
 
 [Badge 크기 자동 스케일링]
   BADGE_R = max(12, min(18, vw × 0.032))
@@ -758,7 +814,7 @@ const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";  // 빈 문자열 → 같은
 2. "Create API Key" 클릭
 3. `backend/.env`에 설정:
    ```
-   GEMINI_API_KEY=AIzaSy...실제키
+   GEMINI_API_KEY=your_gemini_api_key_here
    ```
 
 ### 15.2 모델 폴백 체인
@@ -794,16 +850,18 @@ rm -f designsync.db   # DB 삭제 (서버 재시작 시 자동 재생성)
 
 ## 16. 향후 작업 (Next Steps)
 
-### 즉시 필요 (Priority 1)
-- [ ] Gemini API 유료 플랜 전환 또는 안정적인 API 키 확보
-- [ ] Gemini 정상 동작 시 E2E 테스트 (구체적 차이점 설명, 정확한 bbox)
-- [ ] 이미지 크기가 크게 다른 경우 (Retina 2x vs 1x) 전처리 보정
-- [ ] 로딩 화면에서 폴링 상태 표시 개선 (processing 단계 세분화)
+### 즉시 필요 (Priority 1) — 검증 & 정확도
+- [ ] 새 분석 실행 후 듀얼 bbox 검증 (디자인 패널 초록 박스 크기/위치)
+- [ ] 상태바 트리밍 검증 (상태바 포함 이미지에서 오탐 제거 확인)
+- [ ] CV+AI 하이브리드 정확도 평가 (10쌍 테스트셋)
+- [ ] Gemini API 안정성 확보 (유료 플랜 또는 안정적 키)
+- [ ] AI 교차 검증 검토 (CV 결과를 AI가 2차 확인)
 
-### 단기 개선 (Priority 2)
+### 단기 개선 (Priority 2) — UX & 기능
+- [ ] 키보드 내비게이션 (↑↓ 화살표로 차이점 이동)
+- [ ] 로딩 화면 단계 세분화 (CV 측정 → AI 라벨링 → 시각 분석)
 - [ ] Google OAuth 인증 (NextAuth.js)
 - [ ] 분석 히스토리 페이지
-- [ ] Pixel diff 폴백 품질 개선 (색상 차이 감지, 텍스트 영역 구분)
 - [ ] 마킹 이미지 다운로드/내보내기 기능
 - [ ] 결과 페이지 반응형 (모바일 대응)
 
@@ -839,3 +897,23 @@ rm -f designsync.db   # DB 삭제 (서버 재시작 시 자동 재생성)
 - **이유:** SSIM contour가 하나의 거대 blob을 생성하는 문제 해결
 - **방법:** 화면의 15% 이상 영역 → 수평 프로젝션 → 빈 행 기반 분할 → 타이트 bbox
 - **효과:** 1개 거대 영역 → 3~10개 UI 요소별 영역으로 세분화
+
+### ADR-005: CV+AI 하이브리드 파이프라인 (2026-02-28)
+- **결정:** 간격/마진/높이 측정을 LLM 대신 CV(OpenCV)로 전환, AI는 라벨링 전용
+- **이유:** LLM은 픽셀 정밀 측정에 부정확 (61px을 32px로 오인 등). CV는 정확한 px 값 보장
+- **방법:** element_analyzer v2 (히스토그램 매칭 + DP 순서보존) + Gemini (밴드 라벨링)
+- **트레이드오프:** CV는 구조적 차이만 감지, 색상/타이포는 여전히 AI 필요
+- **효과:** 간격 측정 정확도 대폭 향상, bbox가 실제 값과 일치
+
+### ADR-006: 듀얼 Bbox 좌표 시스템 (2026-02-28)
+- **결정:** 각 차이에 dev bbox + design bbox 두 세트 저장
+- **이유:** dev 좌표를 design 패널에 스케일링하면 크기 불일치 발생
+- **방법:** element_analyzer에서 양쪽 밴드 좌표로 생성 → analyze.py에서 원본 공간 변환 → DB 저장
+- **Fallback:** Gemini visual_diffs는 design_bbox 없음 → 0 저장 → frontend에서 bbox*scale 사용
+- **효과:** 디자인/개발 패널 모두 정확한 하이라이트 표시
+
+### ADR-007: 상태바 트리밍 (2026-02-28)
+- **결정:** 상태바 영역을 필터링(제거) 대신 트리밍(잘라내기) 방식으로 처리
+- **이유:** y_end 기반 필터는 상태바 경계를 걸치는 밴드를 놓침 → 오탐 발생
+- **방법:** `_trim_status_bar()` — 상단 7% 경계에서 밴드를 잘라내고, 남은 부분이 10px 미만이면 제거
+- **효과:** 상태바 포함 이미지에서 오탐 제거
